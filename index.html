@@ -142,13 +142,17 @@
   .egg-btn { text-align: center; margin: 32px 0 4px; }
   .egg-btn button { background: none; border: 0; padding: 4px; cursor: pointer; opacity: .6; }
   .egg-btn img { width: 34px; height: auto; image-rendering: pixelated; display: block; margin: 0 auto; }
+  #syncStatus { font-size: 12px; opacity: .8; white-space: nowrap; }
+  .login-box { text-align: left; }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 </head>
 <body>
 
 <header>
   <h1>Scouting FTC</h1>
   <span class="event" id="eventLabel">Sin evento</span>
+  <span id="syncStatus"></span>
 </header>
 
 <nav role="tablist">
@@ -164,7 +168,8 @@
   <!-- EVENTOS -->
   <section id="tab-eventos">
     <h2>Elige el regional</h2>
-    <p class="hint">Temporada BioBuzz 2026-27. Los datos se guardan mientras la página esté abierta.</p>
+    <p class="hint">Temporada BioBuzz 2026-27. Los datos se guardan en este teléfono y se suben cuando hay internet.</p>
+    <button class="btn ghost small" id="syncBtn" style="margin-bottom:12px">Sincronizar ahora</button>
     <div id="eventList"></div>
   </section>
 
@@ -293,6 +298,16 @@
   </div>
 </div>
 
+<div class="egg" id="login" role="dialog" aria-label="Iniciar sesión">
+  <div class="login-box">
+    <h2>Iniciar sesión</h2>
+    <p class="hint">Escribe el correo con el que te invitó el admin. Te llegará un enlace para entrar.</p>
+    <input type="text" id="loginEmail" placeholder="correo@ejemplo.com" autocomplete="email">
+    <div style="margin-top:10px"><button class="btn" id="loginSend">Enviar enlace</button></div>
+    <p class="hint" id="loginMsg" style="margin-top:10px"></p>
+    <div style="margin-top:6px"><button class="btn ghost" id="loginSkip">Usar sin cuenta (solo este teléfono)</button></div>
+  </div>
+</div>
 <script>
 // ---------- CONFIGURACIÓN ----------
 const EVENTS = [
@@ -451,6 +466,7 @@ $("#addTeam").addEventListener("click", () => {
   if (!n) return;
   if (!state.teams[n]) newTeamRecord(n);
   $("#newTeam").value = "";
+  persist();
   renderTeams();
   openTeam(n);
 });
@@ -527,6 +543,7 @@ $("#photoInput").addEventListener("change", (e) => {
       c.width = img.width * scale; c.height = img.height * scale;
       c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
       state.teams[currentTeam].photo = c.toDataURL("image/jpeg", 0.8);
+      persist();
       openTeam(currentTeam);
     };
     img.src = reader.result;
@@ -647,7 +664,10 @@ $("#saveTeam").addEventListener("click", () => {
     delete r.currentAction; return r;
   }) : [];
   t.scoutedAt = new Date().toISOString();
+  t.dirty = true;
+  persist();
   $("#teamSaved").textContent = "Ficha guardada";
+  syncNow();
   renderTeams();
 });
 
@@ -709,9 +729,11 @@ function drawMatch() {
 
 $("#saveMatch").addEventListener("click", () => {
   if (!currentMatch || ![...currentMatch.red, ...currentMatch.blue].some(Boolean)) { $("#matchSaved").textContent = "Elige al menos un equipo"; return; }
-  currentMatch.saved = true; currentMatch.savedAt = new Date().toISOString();
+  currentMatch.saved = true; currentMatch.savedAt = new Date().toISOString(); currentMatch.dirty = true;
   state.matches.push(currentMatch);
+  persist();
   $("#matchSaved").textContent = "Partido guardado";
+  syncNow();
   renderMatch();
 });
 
@@ -882,14 +904,144 @@ function renderCompare() {
     </table></div><p class="hint" style="margin-top:12px">Promedio de puntos por partido y por fase, según el scouting.</p>` : `<p class="hint">Todavía no hay equipos.</p>`;
 }
 
+// ---------- PERSISTENCIA, LOGIN Y SINCRONIZACIÓN ----------
+const SB_URL = "https://xtvubfnwdprjluqchgcz.supabase.co";
+const SB_KEY = "sb_publishable_-dKZcbt3fTFMyPBf7Xvj8g_oANtLar4";
+const SITE = "https://wicholesp1808-hash.github.io/scouting-ftc/";
+const KEY_STORE = "scouting.ftc.v1";
+const sb = (window.supabase && navigator.onLine !== undefined) ? window.supabase.createClient(SB_URL, SB_KEY) : null;
+let session = null, syncing = false;
+
+function persist() {
+  if (state.event) store[state.event] = { teams: state.teams, matches: state.matches };
+  try { localStorage.setItem(KEY_STORE, JSON.stringify({ event: state.event, store })); }
+  catch (e) { setStatus("Memoria del teléfono llena: exporta un respaldo"); }
+}
+
+function uuidv4() {
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0; return (c === "x" ? r : (r & 3 | 8)).toString(16);
+  });
+}
+
+function pendingCount() {
+  let n = 0;
+  Object.values(store).forEach(ev => {
+    Object.values(ev.teams).forEach(t => { if (t.dirty) n++; });
+    ev.matches.forEach(m => { if (m.dirty) n++; });
+  });
+  return n;
+}
+
+function setStatus(text) { $("#syncStatus").textContent = text; }
+
+function updateStatus() {
+  if (!sb) return setStatus("Sin conexión a la nube · pendientes: " + pendingCount());
+  const net = navigator.onLine ? "En línea" : "Sin internet";
+  const who = session ? "" : " · sin sesión";
+  setStatus(net + " · pendientes: " + pendingCount() + who);
+}
+
+function showLogin() { $("#login").classList.add("on"); }
+function hideLogin() { $("#login").classList.remove("on"); }
+
+async function sendLink() {
+  const email = $("#loginEmail").value.trim();
+  if (!email || !sb) return;
+  $("#loginMsg").textContent = "Enviando…";
+  const { error } = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: SITE, shouldCreateUser: false } });
+  $("#loginMsg").textContent = error
+    ? "No se pudo enviar: " + error.message + ". Revisa que el admin te haya invitado."
+    : "Listo. Abre el enlace que llegó a tu correo desde este mismo teléfono.";
+}
+
+async function initAuth() {
+  if (!sb) return;
+  const { data } = await sb.auth.getSession();
+  session = data.session;
+  sb.auth.onAuthStateChange((_event, s) => { session = s; if (s) hideLogin(); updateStatus(); if (s) syncNow(); });
+  if (session) { hideLogin(); } else { showLogin(); }
+  updateStatus();
+  syncNow();
+}
+
+const blankTeam = (t) => !t.chassis && !t.photo && !t.notes && !(t.autos || []).length && !(t.mechanisms || []).length;
+
+async function pullNow() {
+  if (!state.event) return;
+  const { data, error } = await sb.from("reports").select("id,kind,team_number,payload").eq("event_code", state.event);
+  if (error) throw error;
+  const known = new Set(state.matches.map(m => m.remoteId));
+  data.forEach(r => {
+    if (r.kind === "team") {
+      const local = state.teams[r.team_number];
+      if (!local || (blankTeam(local) && !local.dirty)) {
+        state.teams[r.team_number] = { ...r.payload, remoteId: r.id, dirty: false };
+      }
+    } else if (r.kind === "match" && !known.has(r.id)) {
+      state.matches.push({ ...r.payload, remoteId: r.id, dirty: false });
+    }
+  });
+}
+
+async function syncNow() {
+  persist();
+  updateStatus();
+  if (!sb || !session || !navigator.onLine || syncing) return;
+  syncing = true;
+  try {
+    for (const [code, ev] of Object.entries(store)) {
+      const rows = [];
+      Object.entries(ev.teams).forEach(([n, t]) => {
+        if (t.dirty) { t.remoteId = t.remoteId || uuidv4(); rows.push({ id: t.remoteId, event_code: code, kind: "team", team_number: n, payload: t }); }
+      });
+      ev.matches.forEach(m => {
+        if (m.dirty) { m.remoteId = m.remoteId || uuidv4(); rows.push({ id: m.remoteId, event_code: code, kind: "match", team_number: null, payload: m }); }
+      });
+      if (!rows.length) continue;
+      const { error } = await sb.from("reports").upsert(rows);
+      if (error) throw error;
+      Object.values(ev.teams).forEach(t => { t.dirty = false; });
+      ev.matches.forEach(m => { m.dirty = false; });
+    }
+    await pullNow();
+    persist();
+    if (!$("#tab-equipos").hidden) renderTeams();
+    setStatus("Sincronizado · " + new Date().toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" }));
+  } catch (e) {
+    console.warn(e);
+    setStatus("Error al sincronizar: " + (e.message || e) + " · pendientes: " + pendingCount());
+  } finally {
+    syncing = false;
+  }
+}
+
+$("#loginSend").addEventListener("click", sendLink);
+$("#loginSkip").addEventListener("click", hideLogin);
+$("#syncBtn").addEventListener("click", syncNow);
+window.addEventListener("online", syncNow);
+window.addEventListener("offline", updateStatus);
+
 // ---------- ARRANQUE ----------
 $("#eggSmall").src = $("#egg img").src;
 $("#eggOpen").addEventListener("click", () => $("#egg").classList.add("on"));
 $("#eggClose").addEventListener("click", () => $("#egg").classList.remove("on"));
 $("#egg").addEventListener("click", (e) => { if (e.target.id === "egg") $("#egg").classList.remove("on"); });
 
+CDMX_TEAMS.forEach(([n, name]) => { TEAM_NAMES[n] = name; });
+const saved = JSON.parse(localStorage.getItem(KEY_STORE) || "null");
+if (saved) {
+  Object.assign(store, saved.store || {});
+  const ev = EVENTS.find(e => e.code === saved.event);
+  if (ev && store[ev.code]) {
+    state.event = ev.code; state.teams = store[ev.code].teams; state.matches = store[ev.code].matches;
+    $("#eventLabel").textContent = ev.name;
+  }
+}
 renderEvents();
 renderTeams();
+initAuth();
+updateStatus();
 </script>
 </body>
 </html>
